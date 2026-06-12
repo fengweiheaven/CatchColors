@@ -1,0 +1,149 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>fallback debug</title>
+<body>
+  <pre id="out">loading</pre>
+  <input id="videoInput" type="file" />
+  <div id="dropZone"></div>
+  <video id="videoPreview" muted playsinline></video>
+  <select id="sampleInterval">
+    <option value="0.2" selected>0.2</option>
+  </select>
+  <input id="matchThreshold" value="0.72" />
+  <input id="apiKeyInput" />
+  <input id="apiBaseInput" />
+  <input id="modelInput" />
+  <button id="analyzeBtn" disabled></button>
+  <button id="pauseBtn" disabled></button>
+  <button id="resetBtn"></button>
+  <button id="copyBtn"></button>
+  <button id="nameBtn"></button>
+  <div id="progressBar"></div>
+  <span id="progressText"></span>
+  <span id="statusText"></span>
+  <span id="fileMeta"></span>
+  <span id="totalGroups"></span>
+  <span id="totalKinds"></span>
+  <span id="eventCount"></span>
+  <table>
+    <tbody id="resultRows"></tbody>
+  </table>
+  <textarea id="plainOutput"></textarea>
+  <span id="templateCount"></span>
+  <div id="eventList"></div>
+  <div id="templateGrid"></div>
+  <canvas id="frameCanvas" hidden></canvas>
+  <script src="./pattern-dictionary.js?v=20260610"></script>
+  <script src="./app.js?v=20260612-y-crop-hotfix23"></script>
+  <script>
+    const out = document.getElementById("out");
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function waitUntilReady() {
+      const start = performance.now();
+      while (performance.now() - start < 30000) {
+        if (state.templates.length && Number.isFinite(els.video.duration) && els.video.duration > 0) return;
+        await sleep(100);
+      }
+      throw new Error("debug page timed out waiting for templates/video");
+    }
+
+    function compactSnapshot(snapshot) {
+      const top = [...snapshot.byId.values()]
+        .sort((a, b) => b.count - a.count || b.maxScore - a.maxScore)
+        .slice(0, 8)
+        .map((item) => ({
+          id: item.id,
+          label: item.label,
+          count: item.count,
+          maxScore: Number(item.maxScore.toFixed(3)),
+        }));
+      return { time: Number(snapshot.time.toFixed(2)), items: snapshot.items.length, ids: snapshot.byId.size, top };
+    }
+
+    function dropsBetween(previous, current) {
+      if (!previous || !current) return [];
+      const drops = [];
+      for (const [id, before] of previous.byId.entries()) {
+        const afterCount = current.byId.get(id)?.count || 0;
+        const drop = before.count - afterCount;
+        if (drop <= 0) continue;
+        drops.push({
+          time: Number(current.time.toFixed(2)),
+          id,
+          before: before.count,
+          after: afterCount,
+          drop,
+          maxScore: Number(before.maxScore.toFixed(3)),
+        });
+      }
+      return drops.sort((a, b) => b.drop - a.drop || b.maxScore - a.maxScore);
+    }
+
+    async function main() {
+      await waitUntilReady();
+      cancelAnalysis();
+      clearLevelVocabulary();
+      clearResults();
+      prepareFrameCanvas();
+
+      const interval = Number(new URLSearchParams(location.search).get("interval") || "1.5");
+      const duration = els.video.duration;
+      let previous = null;
+      const pending = new Map();
+      const snapshots = [];
+      const allDrops = [];
+      const eventMoments = [];
+
+      for (let time = 0; time <= duration; time += interval) {
+        await seekVideo(Math.min(time, duration - 0.05));
+        drawFrame();
+        const current = detectBoardFallbackSnapshot(time);
+        snapshots.push(compactSnapshot(current));
+        allDrops.push(...dropsBetween(previous, current).slice(0, 5));
+        const beforeEvents = state.events.length;
+        await updateBoardFallbackDrops(state.events, pending, previous, current, time);
+        if (state.events.length !== beforeEvents) {
+          eventMoments.push({
+            time: Number(time.toFixed(2)),
+            added: state.events.length - beforeEvents,
+            events: state.events.slice(beforeEvents).map((event) => ({
+              id: event.id,
+              count: event.count,
+              source: event.source,
+              time: Number(event.time.toFixed(2)),
+            })),
+          });
+        }
+        previous = current;
+        if (snapshots.length % 8 === 0) {
+          out.textContent = JSON.stringify({ status: "running", time, events: state.events.length }, null, 2);
+          await sleep(0);
+        }
+      }
+
+      flushLiveResults(true);
+      out.textContent = JSON.stringify(
+        {
+          duration,
+          interval,
+          events: state.events.length,
+          output: els.plainOutput.value,
+          firstSnapshots: snapshots.slice(0, 5),
+          lastSnapshots: snapshots.slice(-5),
+          largestDrops: allDrops.sort((a, b) => b.drop - a.drop || b.maxScore - a.maxScore).slice(0, 30),
+          eventMoments,
+        },
+        null,
+        2,
+      );
+    }
+
+    main().catch((error) => {
+      out.textContent = error.stack || String(error);
+    });
+  </script>
+</body>

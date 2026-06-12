@@ -1,0 +1,198 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>position debug</title>
+<body>
+  <pre id="out">loading</pre>
+  <video id="video" muted playsinline></video>
+  <canvas id="frame" width="622" height="1146" hidden></canvas>
+  <script>
+    const REF = {
+      width: 622,
+      height: 1146,
+      slotCentersX: [58, 141, 224, 307, 390, 473, 556],
+      slotCenterY: 207,
+      slotSize: 76,
+    };
+    const out = document.getElementById("out");
+    const video = document.getElementById("video");
+    const frame = document.getElementById("frame");
+    const ctx = frame.getContext("2d", { willReadFrequently: true });
+    const vector = document.createElement("canvas");
+    vector.width = 40;
+    vector.height = 40;
+    const vctx = vector.getContext("2d", { willReadFrequently: true });
+
+    const params = new URLSearchParams(location.search);
+    video.src = params.get("video") || "__tmp_level13_regression.MP4";
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function isContentPixel(r, g, b) {
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const saturation = (max - min) / Math.max(max, 1);
+      const brightness = max / 255;
+      const nearWhite = r > 226 && g > 226 && b > 220;
+      const trayPurple = b > 70 && r > 35 && r < 135 && g < 90;
+      if (nearWhite || trayPurple) return false;
+      return (saturation > 0.16 && brightness > 0.26) || brightness < 0.42;
+    }
+
+    function cropFeatures(x, y, size) {
+      vctx.clearRect(0, 0, 40, 40);
+      vctx.drawImage(frame, x, y, size, size, 0, 0, 40, 40);
+      const data = vctx.getImageData(0, 0, 40, 40).data;
+      let white = 0;
+      let content = 0;
+      let minX = 40;
+      let minY = 40;
+      let maxX = -1;
+      let maxY = -1;
+      let edge = 0;
+      for (let i = 0, p = 0; i < 1600; i += 1, p += 4) {
+        const r = data[p];
+        const g = data[p + 1];
+        const b = data[p + 2];
+        if (r > 205 && g > 205 && b > 200) white += 1;
+        if (!isContentPixel(r, g, b)) continue;
+        content += 1;
+        const px = i % 40;
+        const py = Math.floor(i / 40);
+        minX = Math.min(minX, px);
+        minY = Math.min(minY, py);
+        maxX = Math.max(maxX, px);
+        maxY = Math.max(maxY, py);
+        if (px <= 2 || py <= 2 || px >= 37 || py >= 37) edge += 1;
+      }
+      const width = maxX >= minX ? maxX - minX + 1 : 0;
+      const height = maxY >= minY ? maxY - minY + 1 : 0;
+      const area = content;
+      const whiteRatio = white / 1600;
+      const contentRatio = content / 1600;
+      const edgeContact = area ? edge / area : 0;
+      const occupied = whiteRatio >= 0.1 && contentRatio >= 0.018;
+      const complete =
+        whiteRatio >= 0.18 &&
+        contentRatio >= 0.018 &&
+        area >= 34 &&
+        width >= 6 &&
+        height >= 6 &&
+        edgeContact < 0.62;
+      return { whiteRatio, contentRatio, area, width, height, edgeContact, occupied, complete };
+    }
+
+    function seek(time) {
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error(`seek timeout ${time}`)), 9000);
+        const done = () => {
+          clearTimeout(timeout);
+          video.removeEventListener("seeked", done);
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        };
+        if (Math.abs(video.currentTime - time) < 0.02) {
+          done();
+          return;
+        }
+        video.addEventListener("seeked", done);
+        video.currentTime = time;
+      });
+    }
+
+    function rowMetrics(y) {
+      let occupied = 0;
+      let complete = 0;
+      let whiteSum = 0;
+      let contentSum = 0;
+      const slots = [];
+      for (const cx of REF.slotCentersX) {
+        const f = cropFeatures(cx - REF.slotSize / 2, y - REF.slotSize / 2, REF.slotSize);
+        if (f.occupied) occupied += 1;
+        if (f.complete) complete += 1;
+        whiteSum += f.whiteRatio;
+        contentSum += f.contentRatio;
+        slots.push({
+          whiteRatio: Number(f.whiteRatio.toFixed(3)),
+          contentRatio: Number(f.contentRatio.toFixed(3)),
+          occupied: f.occupied,
+          complete: f.complete,
+        });
+      }
+      return {
+        y,
+        occupied,
+        complete,
+        whiteAvg: Number((whiteSum / REF.slotCentersX.length).toFixed(3)),
+        contentAvg: Number((contentSum / REF.slotCentersX.length).toFixed(3)),
+        slots,
+      };
+    }
+
+    async function main() {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("metadata timeout")), 15000);
+        video.addEventListener(
+          "loadedmetadata",
+          () => {
+            clearTimeout(timeout);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      frame.width = video.videoWidth;
+      frame.height = video.videoHeight;
+
+      const requestedTimes = (params.get("times") || "5,15,30,45,60,75,90,100")
+        .split(",")
+        .map((item) => Number(item.trim()))
+        .filter((value) => Number.isFinite(value));
+      const rows = [];
+      for (const rawTime of requestedTimes) {
+        const time = Math.min(rawTime, Math.max(0, video.duration - 0.2));
+        await seek(time);
+        ctx.drawImage(video, 0, 0, frame.width, frame.height);
+        const fixed = rowMetrics(REF.slotCenterY);
+        const candidates = [];
+        for (let y = 80; y <= 980; y += 14) {
+          candidates.push(rowMetrics(y));
+        }
+        candidates.sort((a, b) => b.complete - a.complete || b.occupied - a.occupied || b.whiteAvg - a.whiteAvg);
+        rows.push({ time, fixed, topRows: candidates.slice(0, 10).map(({ slots, ...rest }) => rest) });
+        out.textContent = JSON.stringify({ status: "running", video: video.src, time }, null, 2);
+        await sleep(0);
+      }
+      const summaryLines = [
+        `video=${video.src.split("/").pop()} size=${video.videoWidth}x${video.videoHeight} duration=${Number(video.duration.toFixed(2))}`,
+        `fixedSlotLine y=${REF.slotCenterY}, x=${REF.slotCentersX.join(",")}, size=${REF.slotSize}`,
+        ...rows.map((row) => {
+          const fixed = `fixed complete=${row.fixed.complete}/7 occupied=${row.fixed.occupied}/7 white=${row.fixed.whiteAvg} content=${row.fixed.contentAvg}`;
+          const top = row.topRows
+            .slice(0, 5)
+            .map((item) => `y${item.y}:c${item.complete}/o${item.occupied}/w${item.whiteAvg}/ct${item.contentAvg}`)
+            .join(" | ");
+          return `t=${row.time}: ${fixed}; topRows ${top}`;
+        }),
+        "",
+        JSON.stringify(
+          {
+            video: video.src,
+            width: video.videoWidth,
+            height: video.videoHeight,
+            duration: Number(video.duration.toFixed(2)),
+            reference: REF,
+            rows,
+          },
+          null,
+          2,
+        ),
+      ];
+      out.textContent = summaryLines.join("\n");
+    }
+
+    main().catch((error) => {
+      out.textContent = error.stack || String(error);
+    });
+  </script>
+</body>

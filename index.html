@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>关卡花色统计</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="app-header">
+        <div>
+          <h1>关卡花色统计</h1>
+          <p id="statusText">等待上传视频</p>
+        </div>
+        <button id="resetBtn" class="ghost-button" type="button">清空</button>
+      </header>
+
+      <section class="workspace">
+        <div class="panel input-panel">
+          <label id="dropZone" class="drop-zone" for="videoInput">
+            <input id="videoInput" type="file" accept="video/*" />
+            <span class="drop-title">上传视频</span>
+            <span id="fileMeta" class="drop-meta">MP4 / MOV / WebM</span>
+          </label>
+
+          <video id="videoPreview" class="video-preview" controls playsinline muted></video>
+
+          <div class="controls">
+            <label>
+              采样间隔
+              <select id="sampleInterval">
+                <option value="0.15">0.15 秒</option>
+                <option value="0.2" selected>0.20 秒</option>
+                <option value="0.25">0.25 秒</option>
+                <option value="0.3">0.30 秒</option>
+              </select>
+            </label>
+            <label>
+              识别阈值
+              <input id="matchThreshold" type="number" min="0.55" max="0.95" step="0.01" value="0.72" />
+            </label>
+            <div class="run-actions">
+              <button id="analyzeBtn" class="primary-button" type="button" disabled>输出结果</button>
+              <button id="pauseBtn" class="ghost-button" type="button" disabled>暂停</button>
+            </div>
+          </div>
+
+          <div class="naming-controls">
+            <label>
+              视觉命名 Key（可填，或用本地服务环境变量）
+              <input id="apiKeyInput" type="password" autocomplete="off" placeholder="OpenAI API Key" />
+            </label>
+            <label>
+              API 地址
+              <input id="apiBaseInput" type="text" value="https://lumos.diandian.info/winky/openai/v1" placeholder="https://.../v1 或 .../chat/completions" />
+            </label>
+            <label>
+              命名模型
+              <input id="modelInput" type="text" value="gpt-5.5" />
+            </label>
+            <button id="nameBtn" class="ghost-button" type="button" disabled>重新命名</button>
+          </div>
+
+          <div class="progress-wrap" aria-live="polite">
+            <div class="progress-track">
+              <div id="progressBar" class="progress-bar"></div>
+            </div>
+            <span id="progressText">0%</span>
+          </div>
+        </div>
+
+        <section class="panel timeline-panel">
+          <div class="section-head">
+            <h2>消除记录</h2>
+            <span id="eventCount">0 条</span>
+          </div>
+          <div id="eventList" class="event-list"></div>
+        </section>
+      </section>
+
+      <section class="panel result-panel">
+        <div class="summary-grid">
+          <div>
+            <span class="metric-label">总花色组数</span>
+            <strong id="totalGroups">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">花色种类</span>
+            <strong id="totalKinds">0</strong>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>花色</th>
+                <th>名称</th>
+                <th>数量</th>
+              </tr>
+            </thead>
+            <tbody id="resultRows">
+              <tr class="empty-row">
+                <td colspan="3">暂无结果</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <label class="output-label" for="plainOutput">文本结果</label>
+        <textarea id="plainOutput" readonly></textarea>
+        <button id="copyBtn" class="ghost-button" type="button" disabled>复制结果</button>
+      </section>
+
+      <section class="panel dictionary-panel">
+        <div class="section-head">
+          <h2>花色字典</h2>
+          <span id="templateCount">0 个模板</span>
+        </div>
+        <div id="templateGrid" class="template-grid"></div>
+      </section>
+    </main>
+
+    <canvas id="frameCanvas" hidden></canvas>
+    <script src="./pattern-dictionary.js?v=20260610"></script>
+    <script src="./app.js?v=20260612-y-crop-hotfix23"></script>
+  </body>
+</html>
