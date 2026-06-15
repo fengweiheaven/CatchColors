@@ -7,3 +7,8 @@ __pycache__/
 __tmp_level*_regression.*
 position-level*.png
 
+# 本地诊断/调试 scratch（不入库）
+_diag/
+events_v2.log
+merged_v2.png
+
