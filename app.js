@@ -94,12 +94,16 @@ const NO_TRAY_FALLBACK_AFTER_SECONDS = 10;
 const NO_TRAY_FALLBACK_MIN_FRAMES = 24;
 const TRAY_CENTER_SCAN = {
   yStart: 150,
-  yEnd: 320,
+  yEnd: 345,
   step: 4,
   minDarkSlots: 4,
   minScore: 8,
 };
 const TRAY_TILE_CROP_Y_OFFSETS = [-24, -16, -8, 0, 8, 16, 24, 32];
+// 托盘占用计数器参数
+const OCCUPANCY_STABLE_FRAMES = 2;   // 瓦片在槽中连续出现同 id 多少帧后确认(避开滑入动画)
+const OCCUPANCY_CLEAR_DROP = 2;      // 占用数相对峰值骤降达此值即判一次消除
+const OCCUPANCY_CLEAR_MIN_GAP = 0.5; // 两次消除最小间隔(秒)，去抖
 const BOARD_FALLBACK_CROP_Y_OFFSETS = [-24, -16, -8, 0, 8, 16, 24];
 const ENABLE_BOARD_BURST_SCAN = false;
 const ENABLE_BOARD_FALLBACK_SCAN = true;
@@ -1390,6 +1394,16 @@ function createAnalysisTask() {
     forceBoardFallback: false,
     trayCenterY: REFERENCE.slotCenterY,
     trayCenterYLocked: false,
+    trayCenterYSamples: [],
+    // 占用计数器状态
+    slotTrack: Array.from({ length: REFERENCE.slotCentersX.length }, () => ({ id: null, stable: 0 })),
+    confirmedSlots: new Array(REFERENCE.slotCentersX.length).fill(null),
+    prevOccCount: 0,
+    lastAddedId: null,
+    lastAddedThumb: "",
+    lastAddedLabel: "",
+    lastClearTime: -Infinity,
+    collectCount: 0,
   };
 }
 
@@ -1405,93 +1419,28 @@ async function runAnalysisLoop(task) {
     updateTaskTrayCenterY(task);
 
     const shatter = detectTrayShatter(task.trayCenterY);
-    const trayTransition = detectTrayTransition(task.trayCenterY);
+    // 逐槽检测：每个被占用的托盘格返回 {slot,id,thumb,score,...}
     const detections = detectTrayTiles(task.threshold, {
       allowUnknown: true,
-      createUnknown: !(shatter || trayTransition),
+      createUnknown: true,
       trayCenterY: task.trayCenterY,
     });
-    const highDetections = detectTrayTiles(Math.max(HIGH_CONFIDENCE_THRESHOLD, task.threshold), {
-      allowUnknown: true,
-      createUnknown: false,
-      trayCenterY: task.trayCenterY,
-    });
-    const hasTrayEvidence = task.trayCenterYLocked || detections.length > 0 || highDetections.length > 0 || shatter || trayTransition;
-    if (hasTrayEvidence) task.trayEvidenceFrames += 1;
-    else task.noTrayFallbackFrames += 1;
 
-    if (
-      ENABLE_BOARD_FALLBACK_SCAN &&
-      state.events.length === 0 &&
-      task.trayEvidenceFrames === 0 &&
-      task.noTrayFallbackFrames >= NO_TRAY_FALLBACK_MIN_FRAMES &&
-      time >= NO_TRAY_FALLBACK_AFTER_SECONDS
-    ) {
-      task.forceBoardFallback = true;
-      els.statusText.textContent = "未找到固定槽，切换到棋盘扫描";
-      break;
-    }
-    const boardBurst = ENABLE_BOARD_BURST_SCAN && detectBoardBurst();
-    const preEventDetections = filterRecentVisualDuplicateDetections(detections, time);
+    // 占用计数：新瓦片稳定入槽=一次收集并定型；占用骤降/碎裂=消除一组
+    await updateOccupancyCounter(task, detections, shatter, time);
 
-    await settleTrayPending(state.events, task.trayPending, preEventDetections, time, shatter || trayTransition);
-    await updateFinalSingles(state.events, task.finalSinglePending, preEventDetections, time, task.duration);
-    const actionableDetections = filterRecentVisualDuplicateDetections(detections, time);
+    recordDebugFrame(task, time, detections, { shatter });
 
-    if (ENABLE_BOARD_BURST_SCAN && boardBurst) {
-      const currentBoardSnapshot = detectBoardSnapshot(time);
-      const boardCandidate = chooseBoardBurstCandidate(task.lastBoardSnapshot, currentBoardSnapshot);
-      if (time - latestEventTime(state.events) > BOARD_BURST_COOLDOWN_SECONDS) {
-        await addEvent(state.events, boardCandidate, time, "board-burst", { sameWindow: 0.75 });
-      }
-    } else if (
-      ENABLE_BOARD_BURST_SCAN &&
-      time - task.lastBoardScanTime >= BOARD_SCAN_INTERVAL_SECONDS &&
-      time - latestEventTime(state.events) > POST_EVENT_IGNORE_SECONDS
-    ) {
-      task.lastBoardSnapshot = detectBoardSnapshot(time);
-      task.lastBoardScanTime = time;
-    }
-
-    if (!shatter && !trayTransition) {
-      for (const candidate of framePotentials(actionableDetections, time)) {
-        task.candidateHistory.push(candidate);
-      }
-      updateTrayPending(state.events, task.trayPending, actionableDetections, time);
-    }
-
-    recordDebugFrame(task, time, actionableDetections, { shatter, trayTransition, boardBurst });
-
-    while (task.candidateHistory.length && time - task.candidateHistory[0].time > SHATTER_HISTORY_SECONDS) {
-      task.candidateHistory.shift();
-    }
-
-    if (DEBUG_MODE && (detections.length > 0 || task.step % 25 === 0)) {
+    if (DEBUG_MODE && (detections.length > 0 || shatter || task.step % 25 === 0)) {
       console.log(JSON.stringify({
         time: Number(time.toFixed(2)),
-        detections,
+        detections: detections.map((d) => ({ slot: d.slot, id: d.id, score: Number((d.score || 0).toFixed(2)) })),
         shatter,
-        trayTransition,
-        boardBurst,
-        candidateHistory: task.candidateHistory.slice(-6),
-        diagnostics: diagnoseTraySlots(task.threshold, task.trayCenterY).slice(0, 4),
+        confirmed: task.confirmedSlots,
+        prevOcc: task.prevOccCount,
+        lastAdded: task.lastAddedId,
+        groups: state.events.length,
       }));
-    }
-
-    if (shatter && !task.shatterActive) {
-      const eventCandidate = chooseEventCandidate(task.candidateHistory, time);
-      if (eventCandidate && time - eventCandidate.lastTime <= 0.8) {
-        if (await addEvent(state.events, eventCandidate, time, "tray-shatter")) {
-          task.trayPending.delete(eventCandidate.id);
-          task.finalSinglePending.delete(eventCandidate.id);
-        }
-      }
-    }
-
-    if (shatter) {
-      task.shatterActive = true;
-    } else {
-      task.shatterActive = false;
     }
 
     flushLiveResults();
@@ -1503,15 +1452,83 @@ async function runAnalysisLoop(task) {
     }
   }
 
-  await finalizePendingAtVideoEnd(task);
-  if (!task.canceled && ENABLE_BOARD_FALLBACK_SCAN && state.events.length === 0) {
-    await runBoardFallbackAnalysis(task);
-  }
   flushLiveResults(true);
   mergeCurrentResultsIntoSavedDictionary();
   renderTemplateGrid();
   setProgress(1);
   els.statusText.textContent = hasUnresolvedNames() ? "分析完成，部分名称可手动精修" : "分析完成";
+}
+
+// 托盘占用计数器：核心思路见 catchcolors-progress 记忆。
+// 1) 每槽独立做稳定确认：瓦片在槽中静止数帧后才"确认"，避开滑入动画导致的 id 抖动；
+//    每确认一个新瓦片即记 lastAddedId（完成三连的那张=被消花色）。
+// 2) 占用数相对峰值骤降 >=2，或检测到白色碎裂 => 判定一次消除（一组），按 lastAddedId 记账并复位。
+//    不再要求"多个同 id 多帧共存"，因此对开局/快速消除也不漏。
+async function updateOccupancyCounter(task, detections, shatter, time) {
+  const idBySlot = new Array(REFERENCE.slotCentersX.length).fill(null);
+  const detBySlot = new Array(REFERENCE.slotCentersX.length).fill(null);
+  for (const d of detections) {
+    idBySlot[d.slot] = d.id;
+    detBySlot[d.slot] = d;
+  }
+  const rawCount = detections.length;
+
+  for (let s = 0; s < REFERENCE.slotCentersX.length; s += 1) {
+    const obs = idBySlot[s];
+    const tr = task.slotTrack[s];
+    if (obs && obs === tr.id) {
+      tr.stable += 1;
+    } else {
+      tr.id = obs;
+      tr.stable = obs ? 1 : 0;
+    }
+    if (obs && tr.stable >= OCCUPANCY_STABLE_FRAMES && task.confirmedSlots[s] !== obs) {
+      // 该槽稳定出现一个"新"已确认 id => 一次收集，记为最近加入的花色（完成三连者）
+      task.confirmedSlots[s] = obs;
+      const d = detBySlot[s];
+      task.lastAddedId = obs;
+      task.lastAddedThumb = d?.thumb || task.lastAddedThumb;
+      task.lastAddedLabel = d?.label || task.lastAddedLabel;
+      task.collectCount += 1;
+    } else if (!obs) {
+      task.confirmedSlots[s] = null;
+    }
+  }
+
+  // 边沿检测：消除 = 占用数相对上一帧"突然下跌"≥阈值（该游戏托盘是累积式，
+  // 不是每组清空，因此必须用相邻帧的跌沿，而非与历史峰值比较）。碎裂作辅助证据。
+  const drop = task.prevOccCount - rawCount;
+  const isClear = (drop >= OCCUPANCY_CLEAR_DROP || (shatter && task.prevOccCount >= 2));
+
+  if (isClear && task.lastAddedId && time - task.lastClearTime > OCCUPANCY_CLEAR_MIN_GAP) {
+    await emitGroupEvent(task.lastAddedId, task.lastAddedThumb, task.lastAddedLabel, time);
+    task.lastClearTime = time;
+  }
+  task.prevOccCount = rawCount;
+}
+
+// 轻量事件登记：绕开 addEvent 的视觉命名门槛（匿名模式下会吞掉未命名事件），
+// 仅做"同 id 近窗"去重，直接产出与汇总/记录渲染兼容的事件对象。
+async function emitGroupEvent(id, thumb, label, time) {
+  if (!id) return false;
+  if (state.events.some((e) => e.id === id && Math.abs(e.time - time) < OCCUPANCY_CLEAR_MIN_GAP)) {
+    return false;
+  }
+  const entry = findLevelEntryById(id);
+  state.events.push({
+    id,
+    time,
+    count: 3,
+    label: entry?.label || label || id,
+    thumb: entry?.thumb || thumb || "",
+    source: "tray-occupancy",
+    score: 0,
+    maxCount: 3,
+    matchSource: "",
+  });
+  state.resultsDirty = true;
+  recordDebugDecision("event-add", time, { id, label }, "tray-occupancy");
+  return true;
 }
 
 function shouldRecordDebugTime(time) {
@@ -1690,35 +1707,44 @@ function drawFrame() {
 }
 
 function updateTaskTrayCenterY(task) {
-  if (!task || task.trayCenterYLocked) return;
-  const detected = detectTrayCenterYFromFrame();
+  if (!task) return;
+  // 每帧尝试检测空托盘的暗槽带中点；只在能检出时累积样本。
+  // 用中位数做稳健估计，避免开局横幅/动画帧把托盘 Y 锁错。
+  // 一旦样本足够多且收敛即标记 locked（仅用于 hasTrayEvidence 判定，不再阻止后续微调）。
+  const detected = detectTrayCenterFromFrame();
   if (!detected) return;
 
-  task.trayCenterY = detected.centerY;
-  task.trayCenterYLocked = true;
+  const samples = task.trayCenterYSamples;
+  samples.push(detected.centerY);
+  if (samples.length > 41) samples.shift();
+  const sorted = samples.slice().sort((a, b) => a - b);
+  task.trayCenterY = sorted[Math.floor(sorted.length / 2)];
+  if (samples.length >= 5) task.trayCenterYLocked = true;
 }
 
 function detectTrayCenterYFromFrame() {
+  return detectTrayCenterFromFrame();
+}
+
+// 扫描每个 refY 的暗槽数，找出"≥minDarkSlots 暗槽"的最长连续区间，返回其中点。
+// 空托盘的暗槽带很高(本例 refY 210~326)，旧逻辑取最接近默认 207 的那行=带顶，
+// 导致裁切比真实瓦片中心高出 ~50px。取带中点可自动居中，且对托盘位于 207 的旧关卡向后兼容。
+function detectTrayCenterFromFrame() {
   const scaleX = els.video.videoWidth / REFERENCE.width;
   const scaleY = els.video.videoHeight / REFERENCE.height;
   const scale = Math.min(scaleX, scaleY);
   const slotSize = REFERENCE.slotSize * scale;
-  const candidates = [];
 
+  const rows = [];
   for (let refY = TRAY_CENTER_SCAN.yStart; refY <= TRAY_CENTER_SCAN.yEnd; refY += TRAY_CENTER_SCAN.step) {
     let darkSlots = 0;
     let score = 0;
-    let darkRatioSum = 0;
-    let whiteRatioSum = 0;
-
     for (const refX of REFERENCE.slotCentersX) {
       const sx = clamp(Math.round(refX * scaleX - slotSize / 2), 0, els.frameCanvas.width - 1);
       const sy = clamp(Math.round(refY * scaleY - slotSize / 2), 0, els.frameCanvas.height - 1);
       const sw = Math.min(Math.max(1, Math.round(slotSize)), els.frameCanvas.width - sx);
       const sh = Math.min(Math.max(1, Math.round(slotSize)), els.frameCanvas.height - sy);
       const profile = traySlotPixelProfile(sx, sy, sw, sh);
-      darkRatioSum += profile.darkRatio;
-      whiteRatioSum += profile.whiteRatio;
       if (profile.darkRatio >= 0.18) {
         darkSlots += 1;
         score += 1.8 + Math.min(1.6, profile.darkRatio * 3);
@@ -1726,21 +1752,32 @@ function detectTrayCenterYFromFrame() {
         score += 0.7;
       }
     }
-
-    const darkAvg = darkRatioSum / REFERENCE.slotCentersX.length;
-    const whiteAvg = whiteRatioSum / REFERENCE.slotCentersX.length;
-    if (darkSlots >= TRAY_CENTER_SCAN.minDarkSlots && score >= TRAY_CENTER_SCAN.minScore) {
-      candidates.push({ centerY: refY, darkSlots, score, darkAvg, whiteAvg });
-    }
+    rows.push({ refY, darkSlots, score });
   }
 
-  if (!candidates.length) return null;
-  candidates.sort((a, b) => {
-    if (b.darkSlots !== a.darkSlots) return b.darkSlots - a.darkSlots;
-    if (b.score !== a.score) return b.score - a.score;
-    return Math.abs(a.centerY - REFERENCE.slotCenterY) - Math.abs(b.centerY - REFERENCE.slotCenterY);
-  });
-  return candidates[0];
+  // 找最长连续的"达标"区间
+  let bestRun = null;
+  let runStart = -1;
+  let runScore = 0;
+  for (let i = 0; i <= rows.length; i += 1) {
+    const ok = i < rows.length && rows[i].darkSlots >= TRAY_CENTER_SCAN.minDarkSlots;
+    if (ok) {
+      if (runStart < 0) { runStart = i; runScore = 0; }
+      runScore += rows[i].score;
+    } else if (runStart >= 0) {
+      const run = { start: runStart, end: i - 1, len: i - runStart, score: runScore };
+      if (!bestRun || run.len > bestRun.len || (run.len === bestRun.len && run.score > bestRun.score)) {
+        bestRun = run;
+      }
+      runStart = -1;
+    }
+  }
+  if (!bestRun) return null;
+
+  const midRow = rows[Math.floor((bestRun.start + bestRun.end) / 2)];
+  const totalScore = rows.slice(bestRun.start, bestRun.end + 1).reduce((s, r) => s + r.score, 0);
+  if (totalScore < TRAY_CENTER_SCAN.minScore) return null;
+  return { centerY: midRow.refY, darkSlots: midRow.darkSlots, score: midRow.score, bandLen: bestRun.len };
 }
 
 function traySlotPixelProfile(sx, sy, sw, sh) {
